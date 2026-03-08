@@ -231,6 +231,8 @@ def _parse_cred(ip: str, cred: str) -> dict:
     import io
     import paramiko
     from config import SSH_USER, SSH_PORT
+    if cred == "local":
+        return {}   # локальный режим — SSH не нужен
     base = {"hostname": ip, "username": SSH_USER, "port": SSH_PORT}
     if cred.startswith("password:"):
         base["password"] = cred[len("password:"):]
@@ -254,6 +256,8 @@ def _parse_cred(ip: str, cred: str) -> dict:
 
 
 def _test_ssh(ip: str, cred: str) -> tuple[bool, str]:
+    if cred == "local" or _is_local(ip):
+        return True, ""   # локальный режим — SSH не нужен
     try:
         import paramiko
         c = paramiko.SSHClient()
