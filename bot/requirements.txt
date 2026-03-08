@@ -1,0 +1,4 @@
+aiogram==3.x
+aiogram-i18n==3.x
+cryptography==41.x
+paramiko==3.x
