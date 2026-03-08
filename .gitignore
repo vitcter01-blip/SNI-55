@@ -1,0 +1,8 @@
+bot/.env
+bot/data/sni_monitor.db
+bot/data/*.jsonl
+bot/data/*.db
+__pycache__/
+*.pyc
+venv/
+.env
