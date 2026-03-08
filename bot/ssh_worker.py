@@ -32,6 +32,8 @@ _DEPS_CMD = (
 
 def _cred_kwargs(ip: str, cred: str) -> dict:
     """Разбирает строку с SSH-данными в kwargs для paramiko."""
+    import io
+    import paramiko
     base: dict = {
         "hostname": ip,
         "username": SSH_USER,
@@ -40,6 +42,19 @@ def _cred_kwargs(ip: str, cred: str) -> dict:
     }
     if cred.startswith("password:"):
         base["password"] = cred[len("password:"):]
+    elif cred.startswith("pkey:"):
+        # Приватный ключ вставлен напрямую (PEM-текст после префикса pkey:)
+        pem = cred[len("pkey:"):].strip().replace("\\n", "\n")
+        buf = io.StringIO(pem)
+        try:
+            base["pkey"] = paramiko.RSAKey.from_private_key(buf)
+        except paramiko.ssh_exception.SSHException:
+            try:
+                buf.seek(0)
+                base["pkey"] = paramiko.Ed25519Key.from_private_key(buf)
+            except Exception:
+                buf.seek(0)
+                base["pkey"] = paramiko.ECDSAKey.from_private_key(buf)
     else:
         base["key_filename"] = cred
     return base

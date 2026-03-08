@@ -66,6 +66,7 @@ def kb_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➕  Добавить сервер",      callback_data="menu:add_server")],
         [InlineKeyboardButton(text="🚀  Проверить все сейчас", callback_data="menu:check_all")],
         [InlineKeyboardButton(text="⏰  Расписание",           callback_data="menu:schedule")],
+        [InlineKeyboardButton(text="🔄  Обновить с GitHub",    callback_data="menu:update")],
     ])
 
 
@@ -220,10 +221,26 @@ def _validate_ip(ip: str) -> tuple[bool, str]:
 
 
 def _parse_cred(ip: str, cred: str) -> dict:
+    import io
+    import paramiko
     from config import SSH_USER, SSH_PORT
     base = {"hostname": ip, "username": SSH_USER, "port": SSH_PORT}
     if cred.startswith("password:"):
         base["password"] = cred[len("password:"):]
+    elif cred.startswith("pkey:"):
+        # Приватный ключ вставлен прямо в чат
+        pem = cred[len("pkey:"):].strip()
+        pem = pem.replace("\\n", "\n")
+        buf = io.StringIO(pem)
+        try:
+            base["pkey"] = paramiko.RSAKey.from_private_key(buf)
+        except paramiko.ssh_exception.SSHException:
+            try:
+                buf.seek(0)
+                base["pkey"] = paramiko.Ed25519Key.from_private_key(buf)
+            except Exception:
+                buf.seek(0)
+                base["pkey"] = paramiko.ECDSAKey.from_private_key(buf)
     else:
         base["key_filename"] = cred
     return base
@@ -304,7 +321,13 @@ async def screen_server_card(target, server_id: int) -> None:
 
     icon   = _status_icon(s["status"])
     last   = _dt(s["last_check_time"]) if s["last_check_time"] else "никогда"
-    cred_t = "🔐 Пароль" if s["ssh_credentials"].startswith("password:") else "🔑 SSH-ключ"
+    c = s["ssh_credentials"]
+    if c.startswith("password:"):
+        cred_t = "🔐 Пароль"
+    elif c.startswith("pkey:"):
+        cred_t = "📋 Приват. ключ (PEM)"
+    else:
+        cred_t = "🔑 Файл ключа"
 
     text = (
         f"{icon} <b>{s['name']}</b>\n\n"
@@ -408,8 +431,10 @@ async def fsm_ip(msg: Message, state: FSMContext) -> None:
     await msg.answer(
         f"✅ IP: <code>{ip}</code>\n\n"
         "<b>Шаг 3 / 3</b> — Введите <b>SSH-данные</b>:\n\n"
-        "🔑 Путь к ключу: <code>/root/.ssh/id_rsa</code>\n"
-        "🔐 Пароль:       <code>password:ваш_пароль</code>",
+        "🔑 Путь к ключу:  <code>/root/.ssh/id_rsa</code>\n"
+        "🔐 Пароль:        <code>password:ваш_пароль</code>\n"
+        "📋 Приват. ключ:  <code>pkey:-----BEGIN ... KEY-----\n...\n-----END ... KEY-----</code>\n\n"
+        "<i>Приватный ключ: вставьте полное содержимое PEM-файла после <b>pkey:</b></i>",
         parse_mode="HTML",
         reply_markup=kb_cancel(),
     )
@@ -1082,6 +1107,127 @@ async def cb_cron_run_now(call: CallbackQuery) -> None:
                 InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"),
             ]]),
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Обновление с GitHub
+# ══════════════════════════════════════════════════════════════════════════════
+
+GITHUB_REPO = "vitcter01-blip/SNI-55"
+INSTALL_DIR = "/opt/sni_monitor"
+
+
+def _do_update() -> tuple[bool, str]:
+    """Скачивает актуальный код с GitHub и перезапускает сервис."""
+    import subprocess, tempfile, os, shutil
+
+    steps = []
+    try:
+        # 1. Скачиваем архив главной ветки
+        zip_url = f"https://github.com/{GITHUB_REPO}/archive/refs/heads/main.zip"
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "update.zip")
+
+            r = subprocess.run(
+                ["curl", "-fsSL", "-o", zip_path, zip_url],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode != 0:
+                return False, f"Ошибка скачивания:\n{r.stderr[:500]}"
+            steps.append("✅ Архив скачан")
+
+            # 2. Распаковываем
+            r = subprocess.run(
+                ["unzip", "-q", "-o", zip_path, "-d", tmp],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode != 0:
+                return False, f"Ошибка распаковки:\n{r.stderr[:300]}"
+            steps.append("✅ Архив распакован")
+
+            # Папка внутри архива называется SNI-55-main
+            src = os.path.join(tmp, "SNI-55-main")
+            if not os.path.isdir(src):
+                return False, "Не найдена папка SNI-55-main в архиве"
+
+            # 3. Копируем файлы (кроме data/ чтобы не затереть БД)
+            for sub in ("bot", "worker"):
+                src_sub = os.path.join(src, sub)
+                dst_sub = os.path.join(INSTALL_DIR, sub)
+                if os.path.isdir(src_sub):
+                    for fname in os.listdir(src_sub):
+                        if fname == "data":
+                            continue
+                        src_f = os.path.join(src_sub, fname)
+                        dst_f = os.path.join(dst_sub, fname)
+                        if os.path.isfile(src_f):
+                            shutil.copy2(src_f, dst_f)
+            # install.sh
+            for fname in ("install.sh",):
+                sf = os.path.join(src, fname)
+                if os.path.isfile(sf):
+                    shutil.copy2(sf, os.path.join(INSTALL_DIR, fname))
+            steps.append("✅ Файлы обновлены")
+
+            # 4. Обновляем pip-зависимости
+            venv_pip = os.path.join(INSTALL_DIR, "venv", "bin", "pip")
+            req = os.path.join(INSTALL_DIR, "bot", "requirements.txt")
+            if os.path.isfile(venv_pip) and os.path.isfile(req):
+                subprocess.run(
+                    [venv_pip, "install", "-q", "-r", req],
+                    capture_output=True, timeout=120,
+                )
+                steps.append("✅ Зависимости обновлены")
+
+            # 5. Перезапускаем сервис
+            r = subprocess.run(
+                ["systemctl", "restart", "sni-monitor"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode != 0:
+                steps.append(f"⚠️ Сервис не перезапущен: {r.stderr[:200]}")
+            else:
+                steps.append("✅ Сервис перезапущен")
+
+        return True, "\n".join(steps)
+
+    except Exception as e:
+        return False, f"Исключение: {e}\n" + "\n".join(steps)
+
+
+@dp.callback_query(F.data == "menu:update")
+async def cb_update_confirm(call: CallbackQuery) -> None:
+    await _edit(call,
+        "🔄 <b>Обновление с GitHub</b>\n\n"
+        f"Репозиторий: <code>{GITHUB_REPO}</code>\n"
+        f"Установка:   <code>{INSTALL_DIR}</code>\n\n"
+        "⚠️ Бот перезапустится. Вы уверены?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, обновить",  callback_data="update:run")],
+            [InlineKeyboardButton(text="❌ Отмена",        callback_data="menu:main")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "update:run")
+async def cb_update_run(call: CallbackQuery) -> None:
+    await _edit(call,
+        "⏳ <b>Обновляю с GitHub…</b>\n\nЭто займёт ~15-30 секунд.",
+        parse_mode="HTML",
+    )
+
+    ok, log_text = await asyncio.to_thread(_do_update)
+
+    icon = "✅" if ok else "❌"
+    await call.message.answer(
+        f"{icon} <b>Обновление {'завершено' if ok else 'не удалось'}</b>\n\n"
+        f"{log_text}",
+        parse_mode="HTML",
+        reply_markup=kb_main() if not ok else InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"),
+        ]]),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
