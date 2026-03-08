@@ -189,3 +189,105 @@ def run_check(ip: str, cred: str,
     finally:
         if client:
             client.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Локальный режим (без SSH)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _is_local(cred: str) -> bool:
+    return cred.strip() == "local"
+
+
+def deploy_worker_local(sni_list_path: Path) -> tuple[bool, str]:
+    """Устанавливает зависимости и копирует файлы локально."""
+    import subprocess, shutil, os
+
+    local_dir = Path(REMOTE_DIR)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    # Копируем sni.py
+    if not _LOCAL_SNI_PY.exists():
+        return False, f"sni.py не найден: {_LOCAL_SNI_PY}"
+    shutil.copy2(str(_LOCAL_SNI_PY), str(local_dir / "sni.py"))
+
+    # Копируем sni.txt
+    if sni_list_path.exists():
+        shutil.copy2(str(sni_list_path), str(local_dir / "sni.txt"))
+
+    # Устанавливаем зависимости
+    pip_cmd = ["pip3", "install", "tqdm", "colorama", "--quiet", "--break-system-packages"]
+    r = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        # fallback без --break-system-packages
+        r = subprocess.run(pip_cmd[:-1], capture_output=True, text=True, timeout=120)
+
+    log.info("[local] Деплой завершён в %s", local_dir)
+    return True, ""
+
+
+def run_check_local(server_name: str, server_id: int) -> tuple[bool, str, Optional[bytes]]:
+    """Запускает sni.py локально, возвращает results.jsonl."""
+    import subprocess, shutil, socket
+
+    local_dir = Path(REMOTE_DIR)
+    out_dir   = local_dir / "scan_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_path = out_dir / "results.jsonl"
+
+    # Очищаем предыдущий результат
+    if results_path.exists():
+        results_path.unlink()
+
+    local_ip = _get_local_ip()
+
+    cmd = [
+        "python3", str(local_dir / "sni.py"),
+        "--server-ip", local_ip,
+        "--server-id", server_name,
+        "--sni-path",  str(local_dir / "sni.txt"),
+        "--out-dir",   str(out_dir),
+        "--no-color",
+        "--no-fsync",
+        "--concurrency", str(CONCURRENCY),
+    ]
+    log.info("[local] Запускаю: %s", " ".join(cmd))
+
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=900, cwd=str(local_dir),
+        )
+        output = r.stdout + r.stderr
+        log.info("[local] Завершено (код %d). Последние строки:\n%s",
+                 r.returncode, output[-400:])
+
+        if r.returncode != 0:
+            return False, output, None
+
+        if results_path.exists():
+            jsonl_bytes = results_path.read_bytes()
+        else:
+            log.warning("[local] results.jsonl не найден")
+            jsonl_bytes = b""
+
+        return True, output, jsonl_bytes
+
+    except subprocess.TimeoutExpired:
+        return False, "Таймаут 15 минут превышен", None
+    except Exception as e:
+        log.exception("[local] Ошибка запуска")
+        return False, str(e), None
+
+
+def _get_local_ip() -> str:
+    """Определяет внешний IP этого сервера."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"

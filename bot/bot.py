@@ -29,7 +29,7 @@ from db import (
     delete_server, update_server_status,
     save_result, get_recent_results, get_result, prune_old_results,
 )
-from ssh_worker import deploy_worker, run_check
+from ssh_worker import deploy_worker, run_check, deploy_worker_local, run_check_local, _is_local as _ssh_is_local
 from report import (
     ScanStats, parse_results_jsonl,
     format_report, format_history_list,
@@ -183,9 +183,16 @@ async def _edit(msg: Message, text: str,
             log.warning("edit_text error: %s", e)
 
 
+def _is_local(ip: str) -> bool:
+    """Локальный адрес — выполнять команды без SSH."""
+    return ip.strip() in ("localhost", "127.0.0.1", "local")
+
+
 def _validate_ip(ip: str) -> tuple[bool, str]:
     """Возвращает (True, "") или (False, "описание ошибки")."""
     ip = ip.strip()
+    if _is_local(ip):
+        return True, ""
     if not ip:
         return False, "IP-адрес не может быть пустым."
 
@@ -322,7 +329,9 @@ async def screen_server_card(target, server_id: int) -> None:
     icon   = _status_icon(s["status"])
     last   = _dt(s["last_check_time"]) if s["last_check_time"] else "никогда"
     c = s["ssh_credentials"]
-    if c.startswith("password:"):
+    if c == "local":
+        cred_t = "🖥 Локальный (без SSH)"
+    elif c.startswith("password:"):
         cred_t = "🔐 Пароль"
     elif c.startswith("pkey:"):
         cred_t = "📋 Приват. ключ (PEM)"
@@ -409,7 +418,8 @@ async def fsm_name(msg: Message, state: FSMContext) -> None:
     await msg.answer(
         f"✅ Название: <b>{name}</b>\n\n"
         "<b>Шаг 2 / 3</b> — Введите <b>IP-адрес</b>:\n"
-        "<i>Например: 185.23.104.77</i>",
+        "<i>Например: <code>185.23.104.77</code>\n"
+        "Или <code>localhost</code> — если сервер установлен здесь</i>",
         parse_mode="HTML",
         reply_markup=kb_cancel(),
     )
@@ -428,6 +438,18 @@ async def fsm_ip(msg: Message, state: FSMContext) -> None:
         return
     await state.update_data(ip=ip)
     await state.set_state(AddServer.waiting_cred)
+    if _is_local(ip):
+        await state.update_data(cred_skip=True)
+        await state.set_state(AddServer.waiting_cred)
+        await msg.answer(
+            f"✅ IP: <code>{ip}</code> — <b>локальный режим</b>\n\n"
+            "<b>Шаг 3 / 3</b> — Введите <b>-</b> или любой текст:\n"
+            "<i>SSH не нужен — бот запустит проверку прямо на этом сервере.</i>\n\n"
+            "Введите <code>local</code> для подтверждения:",
+            parse_mode="HTML",
+            reply_markup=kb_cancel(),
+        )
+        return
     await msg.answer(
         f"✅ IP: <code>{ip}</code>\n\n"
         "<b>Шаг 3 / 3</b> — Введите <b>SSH-данные</b>:\n\n"
@@ -446,15 +468,37 @@ async def fsm_cred(msg: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.clear()
 
+    ip = data["ip"]
+
+    # ── Локальный режим (localhost / 127.0.0.1) ──────────────────────────────
+    if _is_local(ip):
+        cred = "local"
+        async with aiosqlite.connect(DB_PATH) as db:
+            server_id = await add_server(db, data["name"], ip, cred)
+        await msg.answer(
+            f"✅ Сервер <b>{data['name']}</b> добавлен!\n\n"
+            f"🖥 Режим: <b>Локальный</b> (без SSH)\n\n"
+            "Нажмите <b>«Развернуть»</b>, чтобы подготовить воркер.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 Развернуть воркер",
+                                      callback_data=f"srv:deploy:{server_id}")],
+                [InlineKeyboardButton(text="◀️ К списку серверов",
+                                      callback_data="menu:servers")],
+            ]),
+        )
+        return
+
+    # ── SSH-режим ─────────────────────────────────────────────────────────────
     wait = await msg.answer(
-        f"⏳ Проверяю SSH-соединение с <code>{data['ip']}</code>…",
+        f"⏳ Проверяю SSH-соединение с <code>{ip}</code>…",
         parse_mode="HTML",
     )
-    ok, err = await asyncio.to_thread(_test_ssh, data["ip"], cred)
+    ok, err = await asyncio.to_thread(_test_ssh, ip, cred)
 
     if not ok:
         await wait.edit_text(
-            f"❌ Не удалось подключиться к <b>{data['ip']}</b>:\n"
+            f"❌ Не удалось подключиться к <b>{ip}</b>:\n"
             f"<code>{err}</code>\n\nСервер <b>не сохранён</b>.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -467,7 +511,7 @@ async def fsm_cred(msg: Message, state: FSMContext) -> None:
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        server_id = await add_server(db, data["name"], data["ip"], cred)
+        server_id = await add_server(db, data["name"], ip, cred)
 
     await wait.edit_text(
         f"✅ Сервер <b>{data['name']}</b> добавлен!\n\n"
@@ -516,10 +560,13 @@ async def cb_deploy(call: CallbackQuery) -> None:
         "Устанавливаю зависимости и копирую файлы.",
     )
 
-    ok, err = await asyncio.to_thread(
-        deploy_worker,
-        server["ip"], server["ssh_credentials"], SNI_LIST_PATH,
-    )
+    if _ssh_is_local(server["ssh_credentials"]):
+        ok, err = await asyncio.to_thread(deploy_worker_local, SNI_LIST_PATH)
+    else:
+        ok, err = await asyncio.to_thread(
+            deploy_worker,
+            server["ip"], server["ssh_credentials"], SNI_LIST_PATH,
+        )
 
     if ok:
         await _edit(
